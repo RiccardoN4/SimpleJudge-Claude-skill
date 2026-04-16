@@ -8,12 +8,15 @@ description: Byte-for-byte Claude Code port of OpenAI PaperBench SimpleJudge. Gr
 **You (Claude) are the grader.** This skill is a port of OpenAI PaperBench's
 `SimpleJudge`. Every prompt, traversal order, file-ranking cutoff, context
 budget, aggregation rule, and output schema is copied verbatim from upstream.
-The single substitution is the LLM call: instead of an OpenAI HTTP request, you
-read the prompts and write the verdicts.
+The single substitution is the LLM transport: instead of OpenAI HTTP requests,
+each of SimpleJudge's three per-leaf LLM calls is performed by you reading a
+prepared prompt file and writing an output file. All three calls are preserved.
 
 **The zero-deviation rule overrides your instincts.** If a prompt is verbose,
-use it anyway. If the message order looks redundant, keep it. If you want to
-merge the grading and extraction steps into one, don't. Upstream reference:
+use it anyway. If the message order looks redundant, keep it. You do NOT merge
+grading (Step 1.2) and score extraction (Step 1.3) into a single reasoning
+pass — they are separate LLM calls in upstream, and they stay separate here.
+Upstream reference:
 
 - `reference/simple_judge_port_notes.md` — component-by-component mapping with
   upstream line numbers
@@ -21,7 +24,25 @@ merge the grading and extraction steps into one, don't. Upstream reference:
 - `reference/algorithms/*` — algorithm descriptions
 
 Read these before Pass 1 on the first invocation. On RESUME, skip to the
-current pass.
+current step.
+
+## The three LLM calls per leaf (know this cold)
+
+Upstream SimpleJudge issues three LLM calls for every graded leaf:
+
+1. **File ranking** (`_prepare_relevant_files`, `simple.py:372-474`) — picks the
+   top-10 most relevant files from a category-filtered tree.
+2. **Grading** (`_construct_grade_leaf_messages` + `grade_leaf`,
+   `simple.py:476-547` + `simple.py:571-582`) — reads the top-10 file contents,
+   the paper, the addendum, the optional `reproduce.sh` / `reproduce.log`,
+   the criterion with its preceding-criteria chain, and the final `GRADING_PROMPT`.
+   Returns prose in `# Expectations / # Reality / # Score` format.
+3. **Score extraction** (`_parse_model_response`, `simple.py:666-710`) —
+   parses the prose into a strict `{valid_score, score, explanation}` object.
+
+The skill's per-leaf loop (§Pass 1 below) has one sub-step per LLM call,
+plus two driver-only plumbing steps around them. Collapsing any of the three
+LLM calls into fewer passes is a Zero Deviation Rule violation.
 
 ## Inputs
 
@@ -34,216 +55,278 @@ The skill is invoked with a path to a **working directory** containing:
 - `submission/` — the candidate codebase directory. If `reproduce.sh` /
   `reproduce.log` exist, they live under `submission/`.
 
-Optional flags (parsed from the user prompt):
+## Flags (parsed from the user prompt)
 
-- `--code-only` — prune rubric to `Code Development` leaves and omit
-  reproduce.sh/log from grading context.
-- `--max-leaves N` — cap the leaf-grading loop at N leaves (testing only; the
-  algorithm itself is unchanged).
-- `--max-prior-nodes N` — cap the parent-context chain length. Default: unlimited.
-- `--max-files N` — top-K for file ranking. Default: 10 (upstream default).
+**Default behaviour: grade all nodes (Code Development, Code Execution,
+Result Analysis).** Subtree leaves are only produced when `max_depth`
+truncation kicks in, which is off by default. Matches SimpleJudge's default
+at `simple.py:80` and `simple.py:81`.
+
+| Flag | Default | Effect |
+|---|---|---|
+| `--code-only` | **off (grade all categories)** | Prune the rubric to `Code Development` leaves only (upstream `tasks.py:338-344`) AND omit the `reproduce.sh` / `reproduce.log` blocks from the grading prompt (upstream `simple.py:492-493`) AND use the system-prompt variant that omits the `reproduce.sh` clause (upstream `constants.py:9-10`). |
+| `--max-leaves N` | unlimited | Cap the leaf-grading loop (testing only; algorithm unchanged). |
+| `--max-prior-nodes N` | unlimited | Truncate the preceding-criteria chain (matches `simple.py:82`). |
+| `--max-files N` | 10 | Top-K for file ranking (matches `simple.py:375`). |
 
 ## Outputs (produced in the working directory)
 
 - `grader_output.json` — extended SimpleJudge-compatible report.
 - `judge_log.md` — human-readable trace.
 - `token_usage.json` — per-leaf and total token-count estimates.
-- `.judge/` — internal state & per-leaf prompt bundles (also used for RESUME).
+- `.judge/` — internal state & per-leaf artefacts (also used for RESUME).
+
+### Per-leaf artefacts under `.judge/leaves/<leaf_id>/`
+
+```
+leaf.json             — the TaskNode for this leaf (metadata)
+ranking_prompt.md     — Step 1.0 input  (written by init)
+ranked_files.txt      — Step 1.0 output (written by you in Step 1.0)
+grading_context.md    — Step 1.1 output (written by prepare-grading-context)
+grading_messages.json — same content as grading_context.md, structured form
+files_shown.json      — list of files whose contents were inlined
+verdict.md            — Step 1.2 output (written by you in Step 1.2)
+score.json            — Step 1.3 output (written by you in Step 1.3)
+verdict.json          — Step 1.4 output (written by record-verdict)
+```
 
 ## RESUME protocol
 
-If the user's invocation begins with `RESUME:` **or** `.judge/judge_state.json`
-already exists under the working directory, do NOT re-init. Run:
+If the user's invocation begins with `RESUME:`, or if `.judge/judge_state.json`
+already exists, do NOT re-init. Run:
 
 ```
 python scripts/judge_driver.py status <workdir>
 ```
 
-and continue from the first non-done leaf. A leaf with status `ranked` means
-`record-ranking` already ran — skip straight to the grading step (step 3 of
-Pass 1). A `pending` leaf needs the full five-step flow. Do not re-grade leaves
-marked `done`.
+and continue from the first non-`done` leaf. Status values and their meaning:
+
+- `pending`           — Step 1.0 not yet done; needs file-ranking
+- `ranked`            — Step 1.0 done; Step 1.1 (prepare-grading-context) is next
+- `context_prepared`  — Step 1.1 done; Step 1.2 (grading LLM call) is next
+- `done`              — Step 1.4 done; verdict recorded
+
+Never re-grade leaves marked `done`. The short-circuit cache is honoured
+(Result Analysis leaves pre-marked `done` at init time by init).
 
 ---
 
 ## Pass 0 — Input validation & setup
 
-1. Confirm `<workdir>/rubric.json` and `<workdir>/submission/` exist. If a
+1. Confirm `<workdir>/rubric.json` and `<workdir>/submission/` exist. If any
    required input is missing, STOP and tell the user.
 2. If `paper.md` is absent but `paper.pdf` is present, the driver will extract
-   automatically via `scripts/extract_paper_text.py`. You don't need to run it
-   yourself.
+   automatically via `scripts/extract_paper_text.py`. You don't need to run it.
 3. Read `reference/simple_judge_port_notes.md`, and at least skim every file
    under `reference/prompts/`. These are your spec.
 4. Run:
    ```
-   python scripts/judge_driver.py init <workdir> [--code-only] [--max-leaves N] [--max-prior-nodes N] [--max-files 10]
+   python scripts/judge_driver.py init <workdir> [--code-only] \
+       [--max-leaves N] [--max-prior-nodes N] [--max-files 10]
    ```
    This:
    - validates inputs,
+   - if `--code-only`, prunes the rubric to Code Development leaves
+     (pre-pruning exactly as upstream does before SimpleJudge is instantiated),
    - builds the filtered directory trees per category,
-   - enumerates leaves depth-first,
-   - precomputes the `file_ranking` prompt bundle for every leaf under
-     `.judge/leaves/<leaf_id>/`,
+   - enumerates leaves in depth-first pre-order,
+   - **immediately short-circuits** Result Analysis leaves to score=0 (with
+     `valid_score=True`) when `reproduce.sh` touched no files (upstream
+     `simple.py:557-568`). These leaves skip all three LLM calls.
+   - for every non-short-circuited leaf, precomputes the Step 1.0 file-ranking
+     prompt under `.judge/leaves/<leaf_id>/`,
    - writes `.judge/judge_state.json`.
-5. Print the leaf count and proceed to Pass 1.
 
-If `--max-leaves` is set, `init` takes the first N leaves in DFS order.
+5. Print leaf counts (total, short-circuited, to-grade) and proceed to Pass 1.
 
 ---
 
-## Pass 1 — Per-leaf grading loop
+## Pass 1 — Per-leaf grading loop (five explicit steps)
 
-For each leaf in order (use `status` to list pending leaves), run these five
-steps. **Do not batch across leaves.** Write each leaf's outputs before moving
-on.
+For each non-`done` leaf in the order printed by `status`, execute ALL FIVE
+steps. Do not skip, reorder, batch across leaves, or collapse any pair. The
+three LLM calls (Steps 1.0, 1.2, 1.3) and the two driver-plumbing steps
+(Steps 1.1, 1.4) together reproduce upstream's `grade_leaf`.
 
-### Step 1 — Read the ranking prompt
+### Step 1.0 — File ranking LLM call  *(LLM call #1)*
 
+Read:
 ```
 .judge/leaves/<leaf_id>/ranking_prompt.md
 ```
 
-This file contains the exact file-ranking messages SimpleJudge sends: the
+This file is the verbatim set of ranking messages SimpleJudge sends: the
 system prompt `FILE_RANKING_PROMPT`, the paper, the addendum, the criterion,
 and the ASCII tree of the submission's whitelisted files (filtered by
-`task_category`). Read it carefully.
+`task_category`).
 
-### Step 2 — Rank files (LLM step 1 — you)
-
-Think about which files most likely bear on this criterion. Then write a
-**plain-text, newline-separated** list of relative file paths, in **descending
-order of relevance**, to:
+Think about which files most likely bear on this criterion. Write a
+newline-separated list of relative file paths **in descending order of
+relevance** to:
 
 ```
 .judge/leaves/<leaf_id>/ranked_files.txt
 ```
 
-Exactly the format SimpleJudge's ranking call emits: one path per line, no
-prose, no bullets, no numbering. List **every** file from the tree (upstream's
-prompt explicitly says "do not leave any out"). The driver will only take the
-top `max_files` (default 10), so relevance ordering matters.
+One path per line, no prose, no numbering, no bullets — exactly the format
+the upstream ranker emits. The driver keeps the top `max_files` (10 default);
+relevance ordering matters.
 
-Then register the ranking with the driver:
-
-```
-python scripts/judge_driver.py record-ranking <workdir> <leaf_id> .judge/leaves/<leaf_id>/ranked_files.txt
-```
-
-This triggers two things:
-- If the leaf is `Result Analysis` AND `reproduce.sh` touched no files, the
-  leaf short-circuits to score=0 with the exact explanation from upstream
-  (`simple.py:557-568`). No further LLM call is made; move to the next leaf.
-- Otherwise the driver fetches the top-K file contents (200kB/file cap,
-  `avail_context_lens[cat] - 2000` token cap total), formats them with
-  `<FILE:…>` tags, and assembles the leaf-grading prompt bundle at
-  `.judge/leaves/<leaf_id>/grading_prompt.md`.
-
-### Step 3 — Read the grading prompt
+Then:
 
 ```
-.judge/leaves/<leaf_id>/grading_prompt.md
+python scripts/judge_driver.py record-ranking <workdir> <leaf_id>
 ```
 
-This is the full message list SimpleJudge sends for leaf grading, in the same
-order (`simple.py:513-547`):
+(The driver reads `ranked_files.txt` from the standard location. Status
+advances from `pending` → `ranked`.)
 
-1. `system`: `build_judge_task_prompt(code_only)` from `system_prompt.txt`
-2. `user`: paper markdown
-3. `user`: addendum block
-4. `user`: relevant-files block (wording varies for `Result Analysis` —
-   upstream `simple.py:480-484`)
-5. *(conditional)* `user`: `reproduce.sh`
-6. *(conditional)* `user`: `reproduce.log` (not for `Code Development`)
-7. `user`: `CRITERION_PROMPT` rendered with preceding criteria chain
-8. `user`: `GRADING_PROMPT` (with "either 0 or 1" for binary leaves, "between
-   0 and 1" for Subtree leaves)
+### Step 1.1 — Prepare grading context  *(driver plumbing, no LLM call)*
 
-### Step 4 — Grade the leaf (LLM step 2 — you)
+```
+python scripts/judge_driver.py prepare-grading-context <workdir> <leaf_id>
+```
 
-Follow the instructions in the grading prompt **exactly**. Produce a prose
-verdict with three headed sections:
+The driver:
+1. Reads `ranked_files.txt` (top-10 paths).
+2. For each path, reads the file (utf-8 → latin-1 fallback, 200 kB cap per
+   file — matches `utils.safe_read_file` and `SIZE_LIMIT_BYTES`).
+3. Wraps each file with `<FILE:path>\n{content}\n</FILE:path>` — exact
+   `format_file` format from `utils.py:186-189`.
+4. Concatenates under the token budget
+   `avail_context_lens[category] - 2000` — matches `simple.py:423`.
+5. Assembles the 8-message grading prompt exactly as SimpleJudge does
+   (`simple.py:513-547`):
+   - `[system]` `build_judge_task_prompt(code_only)`
+   - `[user]` the paper
+   - `[user]` the addendum
+   - `[user]` the relevant files block (wording varies for Result Analysis —
+     `simple.py:480-484`), with the `<FILE:...>` blocks **inlined**
+   - *(if not `code_only`)* `[user]` `reproduce.sh`
+   - *(if not `code_only` and not Code Development)* `[user]` `reproduce.log`
+   - `[user]` `CRITERION_PROMPT` with preceding-criteria chain
+   - `[user]` `GRADING_PROMPT(continuous=...)`
+6. Writes `grading_context.md` — the SINGLE file you read in Step 1.2. It
+   contains every message in order with all placeholders substituted and
+   every `<FILE:...>` block materialized.
+
+Status advances `ranked` → `context_prepared`.
+
+### Step 1.2 — Grading LLM call  *(LLM call #2)*
+
+**Read `.judge/leaves/<leaf_id>/grading_context.md` IN FULL**, including
+every `<FILE:...>` block. Do not skim. Do not infer from filenames. If the
+file contents don't support a confident verdict, say so in the prose — do
+not fabricate observations.
+
+Follow the instructions in the embedded `GRADING_PROMPT` verbatim. Produce a
+prose verdict with three headed sections:
 
 ```
 # Expectations
 ...what correct resolution looks like per the paper...
 
 # Reality
-...what the submission actually shows, citing file tags explicitly...
+...what the submission actually shows, citing <FILE:...> blocks explicitly...
 
 # Score
-<reasoning> <0 or 1>
+<reasoning that a binary 0/1 — or 0..1 float for Subtree leaves — would be
+appropriate, and why>
 ```
 
-Be strict and thorough in your criterion's scope; do NOT check things outside
-that scope. If something is missing from the submission, treat it as a failure
-(upstream `GRADING_PROMPT` "Other notes" clause, `constants.py:38-41`).
+The `# Score` section should contain reasoning in prose. **Do not write a
+structured JSON or a clean extracted numeric score here** — that is
+Step 1.3's job. The grading LLM in upstream produces natural prose which
+the extraction LLM then parses; you do the same.
 
-Write the verdict to:
+Write to:
 
 ```
 .judge/leaves/<leaf_id>/verdict.md
 ```
 
-### Step 5 — Extract the score (LLM step 3 — you)
+### Step 1.3 — Score extraction LLM call  *(LLM call #3)*
 
-SimpleJudge uses a **separate** structured-output call to parse the prose into
-`{valid_score, score, justification}`. You do the same: read your own prose
-verdict, then apply the extraction prompt at
-`reference/prompts/score_extraction_prompt.txt` with `{score_instruction}`
-substituted:
+This is a **separate** reasoning pass. Treat it as if a different model were
+running: you have the prose verdict (the input) and the extraction prompt
+(the instruction) — nothing else. Do not re-read the grading context; do not
+revise the prose. Extract only.
 
-- `(either 0 or 1)` for non-Subtree leaves (the common case)
-- `(between 0 and 1)` for Subtree leaves (only produced when `max_depth`
-  truncation forces a subtree shim — not used by default)
+Read:
+1. `.judge/leaves/<leaf_id>/verdict.md` (Step 1.2 output)
+2. `reference/prompts/score_extraction_prompt.txt` — the extraction system
+   prompt. Substitute `{score_instruction}` with:
+   - `(either 0 or 1)` for non-Subtree leaves (the common case)
+   - `(between 0 and 1)` for Subtree leaves (only reached via `max_depth`
+     truncation — not used by default)
 
-Extract:
-
-- `score`: integer `0` or `1` (binary) or float in `[0, 1]` (continuous).
-  Never boolean, never `0.0`/`1.0` for binary leaves.
-- `valid_score`: `true` unless the prose clearly lacks a score.
-- `justification`: short 1-3 sentence summary of the reasoning.
-
-Register the verdict:
+Apply the extraction prompt to the prose verdict. Produce a strict JSON
+object and write it to:
 
 ```
-python scripts/judge_driver.py record-verdict <workdir> <leaf_id> \
-  .judge/leaves/<leaf_id>/verdict.md \
-  --score 0|1 \
-  --valid-score true \
-  --justification "<short summary>"
+.judge/leaves/<leaf_id>/score.json
 ```
 
-The driver updates `.judge/judge_state.json` after every verdict so
-interruption is safe.
+Shape (matches `ParsedJudgeResponseInt` / `ParsedJudgeResponseFloat` —
+`simple.py:44-53`):
+
+```json
+{
+  "valid_score": true,
+  "score": 0,
+  "explanation": "short 1-3 sentence summary of the judge's reasoning"
+}
+```
+
+Rules:
+- Non-Subtree leaf: `score` is an **integer** `0` or `1`. Never boolean,
+  never `0.0`/`1.0`. If the prose doesn't clearly support a score, set
+  `valid_score: false` and `score: 0`.
+- Subtree leaf: `score` is a **float** in `[0.0, 1.0]`.
+- `valid_score: false` forces the final recorded score to `0.0` (matches
+  upstream `simple.py:690-694` + `base.py:142-153`).
+
+### Step 1.4 — Record the verdict  *(driver plumbing, no LLM call)*
+
+```
+python scripts/judge_driver.py record-verdict <workdir> <leaf_id>
+```
+
+The driver:
+- reads `score.json` (MANDATORY — fails loudly if missing),
+- reads `verdict.md` (for the `prose_verdict` field),
+- if `valid_score` is `false` OR the score is outside `[0, 1]`, falls back
+  to `score=0.0, valid_score=False` (upstream `simple.py:690-694` / `base.py:142-153`),
+- writes `verdict.json`,
+- updates token-usage accounting and `judge_state.json`.
+
+No CLI `--score` flag exists. The driver refuses scores unless they come from
+`score.json`. This enforces the three-LLM-call separation.
+
+Status advances `context_prepared` → `done`.
 
 ### Leaf-level guards (upstream parity)
 
-- **Result Analysis short-circuit** — handled automatically by
-  `record-ranking`; do not grade these leaves if the driver reports a
-  short-circuit.
-- **Grading exception** — if you get stuck and cannot produce a verdict, call
-  `record-verdict` with `--score 0 --valid-score false --justification
-  "<reason>"`. Upstream `base.py:146-153` does the equivalent on exception.
-
-### Checkpointing
-
-The driver writes state after every `record-verdict`. If interrupted, resume
-by running `status` and continuing from the first non-done leaf.
+- **Result Analysis short-circuit** — handled at `init` time. These leaves
+  are already `done` when Pass 1 starts and need no action from you.
+- **Grading failure** — if at any step you cannot produce a usable output
+  (e.g., score.json parsing genuinely fails), write `score.json` with
+  `valid_score: false, score: 0` and a short `explanation`. The driver
+  records it as a failed leaf (`score=0.0, valid_score=False`), matching
+  upstream's exception path at `base.py:142-153`.
 
 ---
 
 ## Pass 2 — Aggregation
 
-After all leaves (or all N for `--max-leaves`) are `done`:
+After all non-done leaves are `done`:
 
 ```
 python scripts/judge_driver.py finalize <workdir>
 ```
 
-The finalize subcommand walks the rubric tree bottom-up, applies each leaf's
-verdict, and computes every internal node's score via the exact
-`score_from_children` formula from `graded_task_node.py:145-153`:
+This walks the rubric tree bottom-up and computes every internal node's score
+via the exact `score_from_children` formula from `graded_task_node.py:145-153`:
 
 ```
 total_weight = sum(child.weight for child in children)
@@ -251,8 +334,8 @@ score        = 0.0 if total_weight == 0 else
                sum(child.score * child.weight for child in children) / total_weight
 ```
 
-Leaf scores stay as ints (0 or 1); internal nodes are floats. This matches
-upstream exactly.
+Leaf scores stay ints (0 or 1) for non-Subtree leaves; internal nodes are
+floats.
 
 ---
 
@@ -262,8 +345,8 @@ upstream exactly.
 
 - `<workdir>/grader_output.json` — extended report per
   `reference/schemas/grader_output_schema.json`. The `simple_judge_compat`
-  subsection holds the upstream shape so you can diff against a real SimpleJudge
-  run.
+  subsection holds the upstream shape for byte-for-byte diffs with a real
+  SimpleJudge run.
 - `<workdir>/judge_log.md` — human-readable trace with per-leaf verdicts.
 - `<workdir>/token_usage.json` — per-leaf and total token-count estimates.
 
@@ -287,7 +370,7 @@ which checks:
 - every leaf has a `valid_score` bool and a score in `[0, 1]`.
 
 If validation fails, `finalize` exits non-zero and prints the error list.
-STOP and show the user the errors — do not silently ignore.
+STOP and show the errors — do not ignore silently.
 
 Finish with a completion banner:
 
@@ -305,40 +388,51 @@ judge_log.md:      <path>
 
 - **Traversal order** — depth-first pre-order over leaves. Use the order
   printed by `status`; don't shuffle.
-- **Parent context** — built by `get_prior_nodes` (ancestors + preceding
-  siblings + preceding siblings of ancestors, excluding target). Already
-  embedded in the grading prompt by the driver; don't add to it, don't
-  summarise it.
-- **File content truncation** — 200kB per file, (`avail_context_lens[cat] -
-  2000`) tokens total. Done by the driver; don't re-truncate.
-- **Top-K** — 10 by default. Don't cut to "just the obviously relevant 2-3
-  files" — upstream always considers the top 10.
-- **Binary score type** — `0` or `1` **int**, never `0.0`/`1.0`, never
-  booleans. The driver enforces this but pass the flag `--score 0` or
-  `--score 1` literally.
-- **Code-only mode** — if invoked with `--code-only`, the rubric is
-  pre-pruned and `reproduce.sh`/`.log` are absent from the grading prompt.
-  Do not mention them in your verdict.
-- **Missing files / exceptions** — score=0, `valid_score=false`,
-  justification = short reason. Upstream `base.py:146-153`.
-- **Do NOT retry with different prompts.** Upstream has no ensemble and no
-  self-correction loop. One pass per leaf.
-- **Do NOT improve the prompts.** If the spec looks clunky, it's still the
-  spec.
+- **Parent context** — built by `get_prior_nodes` and embedded in the
+  grading prompt by the driver. Don't add to it, don't summarise it.
+- **File content truncation** — 200 kB per file, total ≤
+  `avail_context_lens[cat] - 2000` tokens. The driver does this; don't
+  re-truncate.
+- **Top-K** — 10 by default. Don't cut to 2-3 "obviously relevant" files.
+- **Binary score type** — integer `0` or `1` in `score.json`, never booleans,
+  never `0.0/1.0`. The driver enforces this but your output has to be correct.
+- **Code-only mode** — `--code-only` prunes the rubric and strips
+  reproduce.sh/log from the prompt. Do not mention them in your verdict.
+- **Do NOT fuse Steps 1.2 and 1.3.** They are two separate LLM calls in
+  upstream. Writing the score into `verdict.md` and then copying it to
+  `score.json` is a deviation even if the final numbers happen to match —
+  don't do it. Reason about the prose in Step 1.2 without writing a clean
+  score; reason about the prose-as-input in Step 1.3 to extract the score.
+- **Missing files / exceptions** — `score=0.0, valid_score=false` via
+  `score.json`. Do not fall through silently.
+- **Do NOT retry with different prompts** (no ensembling, no self-correction).
+- **Do NOT improve the prompts.**
 
 ---
 
 ## Quick reference — driver commands
 
 ```
-python scripts/judge_driver.py init <workdir> [flags]
+python scripts/judge_driver.py init <workdir> [--code-only] [flags]
 python scripts/judge_driver.py status <workdir>
-python scripts/judge_driver.py record-ranking <workdir> <leaf_id> <ranked_files_path>
-python scripts/judge_driver.py record-verdict <workdir> <leaf_id> <prose_path> --score 0|1 [--valid-score true|false] [--justification TEXT]
+
+# Per-leaf loop (all five steps per leaf, in order):
+# Step 1.0: you write ranked_files.txt, then:
+python scripts/judge_driver.py record-ranking <workdir> <leaf_id>
+
+# Step 1.1:
+python scripts/judge_driver.py prepare-grading-context <workdir> <leaf_id>
+
+# Step 1.2: you read grading_context.md, write verdict.md  (no driver call)
+# Step 1.3: you read verdict.md + score_extraction_prompt.txt, write score.json  (no driver call)
+
+# Step 1.4:
+python scripts/judge_driver.py record-verdict <workdir> <leaf_id>
+
 python scripts/judge_driver.py finalize <workdir>
 ```
 
-Reference-only:
+Reference-only helpers:
 
 ```
 python scripts/aggregate_scores.py <tree.json> [--field tree] [--print-leaves]
@@ -350,6 +444,6 @@ python scripts/extract_paper_text.py <paper.pdf> <out.md>
 
 ## One last reminder
 
-You are the LLM. Read the prompts the driver prepares, follow them verbatim,
-write back your output in the format upstream expects. The only fidelity
-hole is the identity of the judge; everything else has to match.
+You are the LLM — three times per leaf. Read each prepared prompt in full,
+follow it verbatim, write the output in the format upstream expects. The
+only fidelity hole is LLM transport; everything else has to match.

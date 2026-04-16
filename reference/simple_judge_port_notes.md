@@ -54,14 +54,25 @@ The extraction-prompt variants mirror upstream `simple.py:675`:
 
 ## 3. Per-leaf message ordering (exact)
 
-Upstream `simple.py:513-548` (`_construct_grade_leaf_messages`) builds messages
-in this exact order. The skill MUST feed Claude Code the same context in the
-same order:
+Upstream `simple.py:513-547` (`_construct_grade_leaf_messages`) builds the
+grading LLM's messages in this exact order. The skill MUST feed Claude Code
+the same context in the same order. In the skill, the driver's
+`prepare-grading-context` subcommand (Step 1.1) materialises all eight
+messages verbatim into a single `grading_context.md` file under
+`.judge/leaves/<leaf_id>/`, substituting every placeholder (paper text,
+addendum, `<FILE:...>` blocks, preceding-criteria chain, reproduce.sh/log,
+criterion, grading instruction) before Claude reads it in Step 1.2.
+
+The eight messages:
 
 1. **system**: `build_judge_task_prompt(code_only)` — from `system_prompt.txt`
 2. **user**: `"The paper is below:\n{paper_md}"`
 3. **user**: `"If included with the paper, you will now be shown an addendum which provides clarification for the paper and how to evaluate its reproduction:\n<addendum>\n{joined_addendum}\n</addendum>"`
-4. **user**: relevant-files block — see §4
+4. **user**: relevant-files block — see §4. The `<FILE:...>...</FILE:...>`
+   blocks are **inlined** into this message by `prepare-grading-context`
+   during Step 1.1; they are NOT a separate attachment. This materialization
+   is exactly what forces grading to be grounded in file contents rather
+   than filename inference.
 5. *(conditional)* **user**: `"Here is the `reproduce.sh` provided in the submission, if any:\n<reproduce.sh>\n{reproduce_sh_content}\n</reproduce.sh>"`
    - Included when `code_only=False`.
    - For `task_category == "Code Development"` **only the sh** is included.
@@ -72,7 +83,8 @@ same order:
 
 Notes:
 - Message 4 text differs for Result Analysis: `simple.py:480-484`. See `reference/algorithms/file_ranking.md`.
-- Placeholders use Python-style `{name}` braces in the prompt files for clarity; the skill's Python helpers substitute them. The skill's human runner (Claude) just reads the already-substituted text.
+- Placeholders use Python-style `{name}` braces in the prompt files for clarity; `prepare-grading-context` substitutes them. Claude reads the already-substituted `grading_context.md` in Step 1.2.
+- The grading-LLM response (Step 1.2 output, `verdict.md`) is then fed to the **separate** score-extraction LLM call (Step 1.3) along with the verbatim `score_extraction_prompt.txt` system message. The extraction-LLM response is `score.json` — matching `ParsedJudgeResponseInt` / `ParsedJudgeResponseFloat`. This is a second, independent structured-output LLM call, exactly as upstream `simple.py:666-710` does.
 
 ---
 
@@ -264,10 +276,48 @@ prose verdicts) outside that subsection. See `reference/schemas/grader_output_sc
 
 ## 14. The one deviation
 
-| SimpleJudge | paperbench-judge skill |
-|---|---|
-| Sends HTTP request to OpenAI with a `ChatCompletionMessageParam` list, receives a string. | Claude Code (the running skill session) reads the same list as plain text, thinks through it, writes the verdict into a file. |
+The ONLY deviation is that each of SimpleJudge's three LLM calls
+(file ranking, grading, score extraction) is performed by Claude Code
+reading a prepared prompt file and writing an output file, rather than
+by an HTTP call to OpenAI. **All three calls are preserved.** All prompts,
+message ordering, truncation, aggregation, traversal, output schema, and
+failure handling are byte-for-byte upstream.
 
-All prompts, message ordering, truncation, aggregation, traversal, and output
-schema are preserved. The only thing that changes is the identity of the LLM
-and its transport.
+Mapping of the three calls to the skill's per-leaf steps:
+
+| # | Upstream call | Upstream site | Skill input (read by Claude) | Skill output (written by Claude) |
+|---|---|---|---|---|
+| 1 | File ranking | `simple.py:372-474` (`_prepare_relevant_files`) | `ranking_prompt.md` | `ranked_files.txt` |
+| 2 | Grading | `simple.py:476-547` + `simple.py:571-582` (`_construct_grade_leaf_messages` + `grade_leaf`) | `grading_context.md` (assembled by `prepare-grading-context`, contains all 8 messages and `<FILE:...>` contents inline) | `verdict.md` (prose only) |
+| 3 | Score extraction | `simple.py:666-710` (`_parse_model_response`) | `verdict.md` + `reference/prompts/score_extraction_prompt.txt` | `score.json` (`ParsedJudgeResponseInt` / `Float` shape) |
+
+Driver plumbing around the three calls:
+
+- `init` — validates inputs, prunes rubric under `--code-only`, enumerates
+  leaves in depth-first pre-order, short-circuits Result Analysis leaves
+  per `simple.py:557-568`, precomputes file-ranking prompts.
+- `record-ranking` — accepts the Step 1.0 output, advances status.
+- `prepare-grading-context` — materialises the 8-message grading prompt
+  with file contents inlined (the piece that made Step 2 possible).
+- `record-verdict` — reads `score.json` (MANDATORY; no CLI-flag score path)
+  and applies the `valid_score=false → score=0.0` fallback from
+  `simple.py:690-694` + `base.py:142-153`.
+- `finalize` — bottom-up weighted aggregation per `graded_task_node.py:145-153`,
+  writes `grader_output.json` (with `simple_judge_compat` subsection for
+  byte-for-byte diffs), runs `validate_output.py`.
+
+What is NOT a deviation (all of these match upstream exactly):
+
+- The eight-message ordering of the grading prompt.
+- The top-K=10 file-ranking cutoff, whitelisted-extension sets, blacklisted
+  base dirs, 200 kB per-file byte cap, `avail_context_lens[cat] - 2000`
+  token budget.
+- `format_file` wrapping with `<FILE:{path}>...</FILE:{path}>`.
+- `get_prior_nodes` parent-context chain.
+- `score_from_children` weighted aggregation (integer leaves, float
+  internals, zero-total-weight → 0.0).
+- Result Analysis auto-zero when `reproduce.sh` touched no files.
+- Binary int vs continuous float score typing by leaf category.
+- Failed-leaf handling (score=0.0, valid_score=False).
+- `grader_output.json` shape (tree + `simple_judge_compat.{root_score,
+  per_leaf_scores, tree}`).

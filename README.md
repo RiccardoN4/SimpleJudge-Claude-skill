@@ -32,16 +32,31 @@ Given a rubric (`rubric.json`), a paper (`paper.pdf` or `paper.md`), optional
 skill grades every leaf of the rubric against the submission and aggregates
 the scores bottom-up into a root score in `[0, 1]`.
 
-The pipeline mirrors SimpleJudge's three LLM steps **per leaf**:
+The pipeline mirrors SimpleJudge's three LLM steps **per leaf**, plus two
+driver-plumbing steps around them:
 
-1. **File ranking.** Claude picks the top-10 most relevant files from a
-   category-filtered tree of the submission.
-2. **Prose verdict.** Claude writes an `# Expectations / # Reality / # Score`
-   verdict using the top-10 files' contents, the paper, the addendum,
-   optionally `reproduce.sh` / `reproduce.log`, the criterion, and the chain
-   of preceding rubric criteria.
-3. **Score extraction.** Claude parses its own prose into a strict
-   `{valid_score, score, justification}` object.
+1. **Step 1.0 — File ranking** *(LLM call #1)*. Claude picks the top-10 most
+   relevant files from a category-filtered tree of the submission.
+2. **Step 1.1 — Prepare grading context** *(driver plumbing)*. Driver reads
+   the top-10 files (200 kB/file cap, token-budget capped total), wraps each
+   one with `<FILE:path>...</FILE:path>` exactly as SimpleJudge does, and
+   assembles the full 8-message grading prompt into a single
+   `grading_context.md` file that Claude reads.
+3. **Step 1.2 — Prose verdict** *(LLM call #2)*. Claude writes an
+   `# Expectations / # Reality / # Score` prose verdict grounded in the
+   `<FILE:...>` blocks. No structured score yet.
+4. **Step 1.3 — Score extraction** *(LLM call #3)*. Claude applies the
+   verbatim `score_extraction_prompt.txt` to the prose and writes a strict
+   `{valid_score: bool, score: int|float, explanation: str}` object to
+   `score.json`. This is a **separate** reasoning pass — upstream uses a
+   different structured-output LLM for it and so does the skill.
+5. **Step 1.4 — Record verdict** *(driver plumbing)*. Driver reads
+   `score.json`, applies the `valid_score=false → score=0.0` fallback
+   matching `simple.py:690-694`, writes `verdict.json`.
+
+Result Analysis leaves are **short-circuited at init time** when
+`reproduce.sh` touched no files (all three LLM calls skipped, verdict
+canned per `simple.py:557-568`).
 
 Scores are then aggregated via the exact upstream formula:
 
@@ -83,9 +98,14 @@ Or with flags:
 
 ### Flags
 
+> **Default behavior: grade all nodes (Code Development, Code Execution,
+> Result Analysis, Subtree).**
+> Pass `--code-only` at init time to restrict grading to Code Development
+> leaves only, matching SimpleJudge's `code_only=True` mode.
+
 | Flag | Default | Effect |
 |---|---|---|
-| `--code-only` | off | Prune rubric to `Code Development` leaves; omit `reproduce.sh` / `reproduce.log` blocks from grading context (upstream `tasks.py:338-344` + `simple.py:492-493`). |
+| `--code-only` | **off (grade all categories)** | Prune rubric to `Code Development` leaves only AND omit `reproduce.sh` / `reproduce.log` blocks from the grading prompt AND use the system-prompt variant that drops the reproduce-script clause. Upstream: `tasks.py:338-344`, `simple.py:492-493`, `constants.py:9-10`. |
 | `--max-leaves N` | unlimited | Cap the leaf-grading loop (testing only; does not change the algorithm). |
 | `--max-prior-nodes N` | unlimited | Truncate the preceding-criteria chain for each leaf. |
 | `--max-files N` | 10 | Top-K used in the file-ranking step (upstream default). |

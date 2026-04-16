@@ -1,41 +1,58 @@
 #!/usr/bin/env python3
 """paperbench-judge driver.
 
-This is the mechanical plumbing for the SimpleJudge port: walking
-the submission directory, building the category-filtered tree
-structure, assembling leaf prompts, running aggregation, writing
-the output JSON. The LLM calls themselves are performed by Claude
-Code (the skill runner) reading the prepared prompts and writing
-back prose verdicts — see SKILL.md for that half of the loop.
+Mechanical plumbing for the SimpleJudge port: walking the submission
+directory, building category-filtered trees, materialising verbatim grading
+prompts, running aggregation, writing the output JSON. The three LLM calls
+themselves are performed by Claude Code (the skill runner) reading prepared
+prompts and writing back output files — see SKILL.md.
+
+Each rubric leaf goes through five ordered steps:
+  Step 1.0 — File ranking LLM call        [Claude writes ranked_files.txt]
+             followed by `record-ranking`
+  Step 1.1 — Prepare grading context      [`prepare-grading-context`]
+  Step 1.2 — Grading LLM call             [Claude writes verdict.md]
+  Step 1.3 — Score extraction LLM call    [Claude writes score.json]
+  Step 1.4 — Record verdict               [`record-verdict`]
 
 Subcommands:
 
   init <workdir> [--code-only] [--max-prior-nodes N] [--max-files 10]
-      [--max-leaves N]
-      Validate inputs, enumerate leaves, write judge_state.json
-      and per-leaf prompt bundles under workdir/.judge/.
+       [--max-leaves N]
+      Validate inputs, optionally prune rubric to Code Development leaves,
+      enumerate leaves depth-first, pre-short-circuit Result Analysis leaves
+      when reproduce.sh touched no files (simple.py:557-568), and write
+      .judge/judge_state.json + per-leaf file-ranking prompts.
 
-  prepare-leaf <workdir> <leaf_id>
-      Build the file-ranking prompt for a single leaf.
-      (Already called by init for every leaf; this is for re-prep.)
+  record-ranking <workdir> <leaf_id> [ranked_files_path]
+      Record the Step 1.0 output. Default path is
+      .judge/leaves/<leaf_id>/ranked_files.txt. Advances status
+      pending -> ranked.
 
-  record-ranking <workdir> <leaf_id> <ranked_files_path>
-      Ingest Claude's ranked file list, fetch file contents within
-      the token budget, assemble the leaf-grading prompt bundle.
+  prepare-grading-context <workdir> <leaf_id>
+      Step 1.1. Fetch ranked file contents under the 200 kB/file cap and
+      the avail_context_lens[cat]-2000 token budget. Assemble the verbatim
+      8-message grading prompt (simple.py:513-547) into grading_context.md
+      with <FILE:...> blocks inlined. Advances ranked -> context_prepared.
 
-  record-verdict <workdir> <leaf_id> <prose_path> --score 0|1 [--valid-score true]
-      [--justification TEXT] [--short-circuit REASON]
-      Ingest Claude's prose verdict + extracted score. Updates the
-      in-memory graded tree and writes a checkpoint.
+  record-verdict <workdir> <leaf_id>
+      Step 1.4. Read score.json (MANDATORY, matches ParsedJudgeResponseInt
+      / ParsedJudgeResponseFloat at simple.py:44-53) and verdict.md. Apply
+      the valid_score=false -> score=0.0 fallback from simple.py:690-694 +
+      base.py:142-153. Advances context_prepared -> done. Does NOT accept a
+      CLI --score flag — structured scoring MUST come from Step 1.3.
 
   finalize <workdir>
-      Aggregate scores, write grader_output.json, judge_log.md,
-      token_usage.json. Validate output shape.
+      Aggregate scores via score_from_children (graded_task_node.py:145-153),
+      write grader_output.json (+ simple_judge_compat subsection for
+      byte-for-byte diffs against native SimpleJudge output), judge_log.md,
+      token_usage.json. Auto-runs validate_output.py.
 
   status <workdir>
-      Print what's done and what's pending.
+      Print what's done and what's pending, by step.
 
-See reference/simple_judge_port_notes.md for the algorithmic contract.
+See reference/simple_judge_port_notes.md for the algorithmic contract and
+reference/prompts/ for the verbatim prompt texts.
 """
 
 from __future__ import annotations
@@ -235,10 +252,11 @@ def get_whitelisted_files(
 
     reproduce_touched_files = True
     if task_category == "Result Analysis" and reproduction_log_creation_time is not None:
-        if files and all(
-            dt.datetime.fromtimestamp(m, tz=dt.timezone.utc) < reproduction_log_creation_time
-            for m in mtimes
-        ):
+        # Port of simple.py:329-334. `all(...)` on an empty list is True, so
+        # a submission with zero Result-Analysis-whitelisted files flips the
+        # flag to False (reproduce.sh produced no touched files to analyze).
+        mtimes_utc = [dt.datetime.fromtimestamp(m, tz=dt.timezone.utc) for m in mtimes]
+        if all(mt < reproduction_log_creation_time for mt in mtimes_utc):
             reproduce_touched_files = False
 
     files.sort()
@@ -521,10 +539,14 @@ def cmd_init(args: argparse.Namespace) -> int:
     judge_addendum = judge_addendum_path.read_text() if judge_addendum_path.exists() else ""
     joined_addendum = f"{addendum}\n{judge_addendum}".strip() or "(NO ADDENDUM GIVEN)"
 
-    # reproduce.sh / reproduce.log (may live under submission/)
+    # reproduce.sh / reproduce.log (may live under submission/).
+    # Port of base.py:46-55 + 70-101: default reproduction_log_creation_time_utc
+    # is now() — this way, when no reproduce.log exists, all submission files
+    # are older than it, and the Result Analysis `all(mtime < ...)` check fires,
+    # flipping reproduce_touched_files to False for Result Analysis leaves.
     reproduce_sh_content = "(Does not exist)"
     reproduce_log_content = "(Does not exist)"
-    reproduction_log_creation_time: Optional[dt.datetime] = None
+    reproduction_log_creation_time: dt.datetime = dt.datetime.now(dt.timezone.utc)
     reproduce_sh = submission / "reproduce.sh"
     reproduce_log = submission / "reproduce.log"
     reproduce_log_ct = submission / "reproduce.log.creation_time"
@@ -584,13 +606,45 @@ def cmd_init(args: argparse.Namespace) -> int:
         tree_structures[cat] = tree_str
         reproduce_touched_by_cat[cat] = touched
 
-    # Per-leaf prompt bundles: we only prepare the FILE RANKING messages here.
-    # The leaf-grading bundle is finalised in record-ranking once Claude returns the ordered list.
+    # Per-leaf prompt bundles. For leaves that are NOT short-circuited we
+    # only prepare the FILE RANKING messages here. For Result Analysis
+    # leaves that are short-circuited (reproduce.sh touched no files — port
+    # of simple.py:557-568), we immediately record the canned verdict and
+    # mark the leaf as done; NO file-ranking LLM call and NO grading LLM
+    # call are performed (matches upstream `grade_leaf` which branches
+    # before `_construct_grade_leaf_messages`).
+    ra_short_circuit = not reproduce_touched_by_cat.get("Result Analysis", True)
+    preseeded_verdicts: dict[str, dict[str, Any]] = {}
+    preseeded_statuses: dict[str, str] = {}
+
     for leaf in leaves:
         leaf_id = leaf["id"]
         tcat = leaf.get("task_category") or "Subtree"
-        tree_str = tree_structures[tcat]
+        leaf_dir = paths["leaves"] / _safe_id(leaf_id)
+        leaf_dir.mkdir(parents=True, exist_ok=True)
+        _write_json(leaf_dir / "leaf.json", leaf)
 
+        # Result Analysis short-circuit (simple.py:557-568).
+        if tcat == "Result Analysis" and ra_short_circuit:
+            verdict = {
+                "score": 0,
+                "valid_score": True,
+                "justification": "Reproduce.sh did not touch any files, so there are no reproduced results to analyze.",
+                "prose_verdict": "",
+                "ranked_files": [],
+                "files_shown_to_grader": [],
+                "short_circuit_reason": "reproduce_did_not_touch_files",
+                "tokens_input_est": 0,
+                "tokens_output_est": 0,
+                "grading_seconds": 0.0,
+            }
+            _write_json(leaf_dir / "verdict.json", verdict)
+            preseeded_verdicts[leaf_id] = verdict
+            preseeded_statuses[leaf_id] = "done"
+            continue
+
+        # Regular leaf: prepare the file-ranking LLM prompt.
+        tree_str = tree_structures[tcat]
         ranking_system = _load("file_ranking_prompt.txt")
         ranking_messages = [{"role": "system", "content": ranking_system}]
         ranking_messages += render_file_ranking_user_message(
@@ -601,20 +655,13 @@ def cmd_init(args: argparse.Namespace) -> int:
             max_files=args.max_files,
         )
 
-        leaf_dir = paths["leaves"] / _safe_id(leaf_id)
-        leaf_dir.mkdir(parents=True, exist_ok=True)
         _write_json(leaf_dir / "ranking_messages.json", ranking_messages)
-        # Human-readable concatenation for the skill runner to read easily.
-        (leaf_dir / "ranking_prompt.md").write_text(
-            _messages_to_md(ranking_messages),
-        )
-        # Placeholder for Claude's output.
+        (leaf_dir / "ranking_prompt.md").write_text(_messages_to_md(ranking_messages))
+        # Placeholder for Claude's output (step 1.0).
         ranked_out = leaf_dir / "ranked_files.txt"
         if not ranked_out.exists():
             ranked_out.write_text("")  # to be filled in
-
-        # Dump leaf metadata for convenience.
-        _write_json(leaf_dir / "leaf.json", leaf)
+        preseeded_statuses[leaf_id] = "pending"
 
     state = {
         "workdir": str(workdir),
@@ -632,28 +679,34 @@ def cmd_init(args: argparse.Namespace) -> int:
         "joined_addendum": joined_addendum,
         "reproduce_sh_content": reproduce_sh_content,
         "reproduce_log_content": reproduce_log_content,
-        "reproduction_log_creation_time": (
-            reproduction_log_creation_time.isoformat() if reproduction_log_creation_time else None
-        ),
+        "reproduction_log_creation_time": reproduction_log_creation_time.isoformat(),
         "avail_context_lens": avail_context_lens,
         "reproduce_touched_by_cat": reproduce_touched_by_cat,
         "tree_structures": tree_structures,
         "rubric": rubric,  # possibly pruned
         "leaves": [l["id"] for l in leaves],
-        "leaf_statuses": {l["id"]: "pending" for l in leaves},
-        "verdicts": {},
+        "leaf_statuses": {l["id"]: preseeded_statuses.get(l["id"], "pending") for l in leaves},
+        "verdicts": preseeded_verdicts,
         "timestamp_start": dt.datetime.now(dt.timezone.utc).isoformat(),
-        "token_usage_total": {"input_tokens_est": 0, "output_tokens_est": 0, "leaves_graded": 0},
+        "token_usage_total": {
+            "input_tokens_est": 0,
+            "output_tokens_est": 0,
+            "leaves_graded": len(preseeded_verdicts),
+        },
     }
     _write_json(paths["state"], state)
 
     print(f"[init] workdir:   {workdir}")
-    print(f"[init] leaves:    {len(leaves)}")
+    print(f"[init] leaves:    {len(leaves)} total "
+          f"({len(preseeded_verdicts)} short-circuited, "
+          f"{len(leaves) - len(preseeded_verdicts)} to grade)")
     print(f"[init] code_only: {args.code_only}")
     print(f"[init] paper:     {paper_source}")
     print(f"[init] rubric:    {rubric_path}")
     print(f"[init] submission:{submission}")
     print(f"[init] state:     {paths['state']}")
+    print(f"[init] reproduce_touched_files (Result Analysis): "
+          f"{reproduce_touched_by_cat.get('Result Analysis', True)}")
     print(f"[init] token encoder: {'tiktoken.o200k_base' if _ENCODER else 'len//4 fallback'}")
     return 0
 
@@ -670,8 +723,16 @@ def _messages_to_md(messages: list[dict[str, str]]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# record-ranking subcommand
+# record-ranking subcommand  (Step 1.0 — file ranking LLM call output)
 # ---------------------------------------------------------------------------
+#
+# This subcommand ONLY records the fact that Claude has produced a file
+# ranking. It does NOT fetch file contents or build the grading prompt;
+# that belongs to `prepare-grading-context` (Step 1.1). This split enforces
+# the same three-LLM-call structure as upstream SimpleJudge:
+#   (1) file ranking LLM  -> ranked_files.txt
+#   (2) grading LLM       -> verdict.md         (via grading_context.md)
+#   (3) score extraction  -> score.json         (via score_extraction_prompt.txt)
 
 def cmd_record_ranking(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).resolve()
@@ -681,59 +742,110 @@ def cmd_record_ranking(args: argparse.Namespace) -> int:
     leaf_id = args.leaf_id
     leaf_dir = paths["leaves"] / _safe_id(leaf_id)
 
-    # Load ranking output.
-    raw = Path(args.ranked_files_path).read_text()
-    selected = [line.strip() for line in raw.splitlines() if line.strip()]
-
-    # Look up the leaf
     rubric = state["rubric"]
     leaf = next((l for l in get_leaf_nodes_dfs(rubric) if l["id"] == leaf_id), None)
     if leaf is None:
         print(f"leaf {leaf_id} not in rubric", file=sys.stderr)
         return 1
 
-    tcat = leaf.get("task_category") or "Subtree"
-
-    # Check Result Analysis short-circuit (simple.py:557-567)
-    if tcat == "Result Analysis" and not state["reproduce_touched_by_cat"].get("Result Analysis", True):
-        verdict = {
-            "score": 0,
-            "valid_score": True,
-            "justification": "Reproduce.sh did not touch any files, so there are no reproduced results to analyze.",
-            "prose_verdict": "",
-            "ranked_files": selected,
-            "files_shown_to_grader": [],
-            "short_circuit_reason": "reproduce_did_not_touch_files",
-            "tokens_input_est": 0,
-            "tokens_output_est": 0,
-            "grading_seconds": 0.0,
-        }
-        _write_json(leaf_dir / "verdict.json", verdict)
-        state["verdicts"][leaf_id] = verdict
-        state["leaf_statuses"][leaf_id] = "done"
-        _write_json(paths["state"], state)
-        print(f"[record-ranking] leaf {leaf_id}: short-circuited (Result Analysis, no touched files)")
+    if state["leaf_statuses"].get(leaf_id) == "done":
+        print(f"[record-ranking] leaf {leaf_id}: already done (short-circuited at init?) — skipping",
+              file=sys.stderr)
         return 0
 
-    # Fetch file contents under token budget. (simple.py:419-474)
+    # Accept an explicit path, else read from the known leaf location.
+    ranked_files_path = Path(args.ranked_files_path) if args.ranked_files_path else (leaf_dir / "ranked_files.txt")
+    if not ranked_files_path.exists():
+        print(f"ranked_files.txt missing: {ranked_files_path}", file=sys.stderr)
+        return 1
+    raw = ranked_files_path.read_text()
+    selected = [line.strip() for line in raw.splitlines() if line.strip()]
+    if not selected:
+        print(f"ranked_files.txt is empty for {leaf_id} — cannot record ranking", file=sys.stderr)
+        return 1
+
+    # If the user wrote the ranking to a different path, also mirror it into
+    # the canonical location so downstream steps read a single source.
+    canonical = leaf_dir / "ranked_files.txt"
+    if ranked_files_path.resolve() != canonical.resolve():
+        canonical.write_text(raw)
+
+    state["leaf_statuses"][leaf_id] = "ranked"
+    _write_json(paths["state"], state)
+    print(f"[record-ranking] leaf {leaf_id}: {len(selected)} filepaths recorded (status=ranked)")
+    return 0
+
+
+# ---------------------------------------------------------------------------
+# prepare-grading-context subcommand  (Step 1.1 — materialize grading prompt)
+# ---------------------------------------------------------------------------
+#
+# After ranking (Step 1.0), this subcommand:
+#   - reads ranked_files.txt
+#   - for each path, reads the file content (200 kB cap, utf-8→latin-1),
+#     wraps it via `format_file` exactly as upstream does, and concatenates
+#     under the `avail_context_lens[cat] - 2000` token budget
+#   - assembles the 8-message grading prompt (simple.py:513-547) with ALL
+#     placeholders substituted — including <FILE:...> blocks inline
+#   - writes `grading_context.md` — the SINGLE input Claude reads in full
+#     before writing the prose verdict (Step 1.2)
+#
+# This is the step that was previously elided: the grading prompt's file
+# contents MUST be materialized in context for Claude to reason over, or
+# the grading LLM is hallucinating from filenames alone.
+
+def cmd_prepare_grading_context(args: argparse.Namespace) -> int:
+    workdir = Path(args.workdir).resolve()
+    paths = _workdir_paths(workdir)
+    state = _read_json(paths["state"])
+
+    leaf_id = args.leaf_id
+    leaf_dir = paths["leaves"] / _safe_id(leaf_id)
+
+    rubric = state["rubric"]
+    leaf = next((l for l in get_leaf_nodes_dfs(rubric) if l["id"] == leaf_id), None)
+    if leaf is None:
+        print(f"leaf {leaf_id} not in rubric", file=sys.stderr)
+        return 1
+
+    if state["leaf_statuses"].get(leaf_id) == "done":
+        print(f"[prepare-grading-context] leaf {leaf_id}: already done — skipping", file=sys.stderr)
+        return 0
+    if state["leaf_statuses"].get(leaf_id) == "pending":
+        print(f"[prepare-grading-context] leaf {leaf_id}: ranking not yet recorded — run record-ranking first", file=sys.stderr)
+        return 1
+
+    tcat = leaf.get("task_category") or "Subtree"
+
+    # Defensive re-check of Result Analysis short-circuit (init should have
+    # handled it, but catch any state discrepancy).
+    if tcat == "Result Analysis" and not state["reproduce_touched_by_cat"].get("Result Analysis", True):
+        print(f"[prepare-grading-context] leaf {leaf_id}: Result Analysis with no "
+              f"touched files; should have been short-circuited at init", file=sys.stderr)
+        return 1
+
+    ranked_path = leaf_dir / "ranked_files.txt"
+    selected = [line.strip() for line in ranked_path.read_text().splitlines() if line.strip()]
+    if not selected:
+        print(f"ranked_files.txt empty for {leaf_id}", file=sys.stderr)
+        return 1
+
+    # --- File content assembly (port of simple.py:419-474) -----------------
     submission_dir = Path(state["submission_path"])
     avail_tokens = state["avail_context_lens"][tcat]
     max_tokens = max(0, avail_tokens - DEFAULT_FILE_CONTENT_BUFFER)
     max_files = state.get("max_files") or DEFAULT_MAX_FILES
 
-    selected_file_tokens: list = []  # list of encoded token chunks
-    total_tokens = 0
     num_files = 0
     files_shown: list[str] = []
 
     if _ENCODER is not None:
         selected_token_stream: list[int] = []
+        total_tokens = 0
         for rel in selected[:max_files]:
             full = submission_dir / rel.strip().strip("/")
             try:
-                if not full.exists():
-                    continue
-                if full.is_dir():
+                if not full.exists() or full.is_dir():
                     continue
                 content = safe_read_file(full)
                 formatted = format_file(full.relative_to(submission_dir), content)
@@ -757,7 +869,6 @@ def cmd_record_ranking(args: argparse.Namespace) -> int:
                 continue
         relevant_files_text = _ENCODER.decode(selected_token_stream).rsplit("\n", 1)[0]
     else:
-        # Char-based fallback.
         max_chars = max_tokens * 4
         chunks: list[str] = []
         total_chars = 0
@@ -785,7 +896,7 @@ def cmd_record_ranking(args: argparse.Namespace) -> int:
                 continue
         relevant_files_text = ("".join(chunks)).rsplit("\n", 1)[0]
 
-    # Build grading messages (simple.py:513-547)
+    # --- 8-message grading prompt assembly (port of simple.py:513-547) ----
     paper_md = Path(state["paper_md_path"]).read_text()
     joined_addendum = state["joined_addendum"]
     code_only = state.get("code_only", False)
@@ -815,7 +926,6 @@ def cmd_record_ranking(args: argparse.Namespace) -> int:
                 )},
             ]
 
-    # Preceding criteria via get_prior_nodes
     prior = get_prior_nodes(rubric, leaf_id, state.get("max_prior_nodes"))
     preceding_criteria = "".join(f" -> {n['requirements']}\n" for n in prior)
 
@@ -844,20 +954,58 @@ def cmd_record_ranking(args: argparse.Namespace) -> int:
     ]
 
     _write_json(leaf_dir / "grading_messages.json", messages)
-    (leaf_dir / "grading_prompt.md").write_text(_messages_to_md(messages))
     _write_json(leaf_dir / "files_shown.json", files_shown)
 
-    # Update state
-    state["leaf_statuses"][leaf_id] = "ranked"
+    # `grading_context.md` is the SINGLE file Claude reads in Step 1.2. It
+    # contains every message in order, with all placeholders substituted and
+    # <FILE:...> content blocks inline, exactly matching what SimpleJudge
+    # would have sent to the grading LLM. A short preamble reminds Claude to
+    # produce the prose verdict per GRADING_PROMPT without embedding a
+    # structured score — score extraction is Step 1.3.
+    preamble = (
+        "# paperbench-judge — grading context (Step 1.1 output)\n\n"
+        "This document is the assembled grading prompt for a single rubric leaf. "
+        "It contains, verbatim and in order, the 8-message conversation that "
+        "SimpleJudge would send to its grading LLM.\n\n"
+        "**Instructions for the grader (Step 1.2):**\n\n"
+        "1. Read this document IN FULL, including every `<FILE:…>` block.\n"
+        "2. Ground your verdict strictly in what these files contain; do not "
+        "infer from filenames.\n"
+        "3. Produce prose output in the exact `# Expectations / # Reality / "
+        "# Score` format demanded by the final grading prompt below.\n"
+        "4. Do NOT output a structured JSON score here — Step 1.3 "
+        "(score extraction) is a separate reasoning pass.\n\n"
+        "---\n\n"
+    )
+    (leaf_dir / "grading_context.md").write_text(preamble + _messages_to_md(messages))
+
+    state["leaf_statuses"][leaf_id] = "context_prepared"
     _write_json(paths["state"], state)
 
-    print(f"[record-ranking] leaf {leaf_id}: {len(files_shown)} files shown, tokens(files) ~= {count_tokens(relevant_files_text)}")
+    print(f"[prepare-grading-context] leaf {leaf_id}: "
+          f"{len(files_shown)} files inlined, tokens(files)≈{count_tokens(relevant_files_text)}, "
+          f"status=context_prepared")
     return 0
 
 
 # ---------------------------------------------------------------------------
-# record-verdict subcommand
+# record-verdict subcommand  (Step 1.4 — record the structured verdict)
 # ---------------------------------------------------------------------------
+#
+# This subcommand consumes the outputs of Steps 1.2 and 1.3:
+#   - verdict.md  — Claude's prose Expectations/Reality/Score output
+#   - score.json  — Claude's structured extraction
+#                   {valid_score: bool, score: int|float, explanation: str}
+#
+# It does NOT accept a score via CLI flags. The structured score MUST be
+# produced by the separate score-extraction reasoning pass (Step 1.3) that
+# uses reference/prompts/score_extraction_prompt.txt. This mirrors
+# SimpleJudge's `_parse_model_response` structured-output call at
+# simple.py:666-710.
+#
+# Failure handling (simple.py:690-710 + base.py:142-153):
+#   - score.json with valid_score=false  -> recorded score = 0.0, valid=False
+#   - score.json with score outside [0,1] -> treated as invalid, recorded 0.0
 
 def cmd_record_verdict(args: argparse.Namespace) -> int:
     workdir = Path(args.workdir).resolve()
@@ -870,31 +1018,66 @@ def cmd_record_verdict(args: argparse.Namespace) -> int:
     if leaf is None:
         print(f"leaf {leaf_id} not in rubric", file=sys.stderr)
         return 1
+    if state["leaf_statuses"].get(leaf_id) == "done":
+        print(f"[record-verdict] leaf {leaf_id}: already done — skipping", file=sys.stderr)
+        return 0
 
     tcat = leaf.get("task_category") or "Subtree"
     continuous = tcat == "Subtree"
 
-    prose = ""
-    if args.prose_path:
-        prose_p = Path(args.prose_path)
-        if prose_p.exists():
-            prose = prose_p.read_text()
+    # --- Read score.json (MANDATORY) --------------------------------------
+    score_json_path = leaf_dir / "score.json"
+    if not score_json_path.exists():
+        print(f"score.json missing: {score_json_path}\n"
+              f"  → Step 1.3 (score extraction) has not been completed for this leaf.",
+              file=sys.stderr)
+        return 1
+    try:
+        score_data = _read_json(score_json_path)
+    except Exception as e:
+        print(f"score.json unreadable: {e}", file=sys.stderr)
+        return 1
 
-    score = args.score
+    valid_score = bool(score_data.get("valid_score", False))
+    raw_score = score_data.get("score", 0)
+    explanation = score_data.get("explanation", "")
+
+    # Upstream simple.py:701-706: if content cannot be parsed, or the score
+    # is outside [0, 1], ParseError is raised. base.py:142-153 catches that
+    # and returns GradedTaskNode(score=0.0, valid_score=False, explanation=str(e)).
+    # We replicate that fallback behaviour here.
     if continuous:
         try:
-            score_val = float(score)
+            val = float(raw_score)
+            if not (0.0 <= val <= 1.0):
+                valid_score = False
+                final_score: Any = 0.0
+            else:
+                final_score = val
         except (TypeError, ValueError):
-            score_val = 0.0
-        score_val = max(0.0, min(1.0, score_val))
+            valid_score = False
+            final_score = 0.0
     else:
         try:
-            score_val = int(float(score))
+            ival = int(raw_score) if not isinstance(raw_score, bool) else int(bool(raw_score))
+            if ival not in (0, 1):
+                valid_score = False
+                final_score = 0
+            else:
+                final_score = ival
         except (TypeError, ValueError):
-            score_val = 0
-        score_val = 1 if score_val == 1 else 0
+            valid_score = False
+            final_score = 0
 
-    # input-token estimate: grading_messages content
+    if not valid_score:
+        # upstream: simple.py:690-694 / base.py:146-153
+        final_score = 0.0 if continuous else 0
+
+    # --- Read verdict.md (the Step 1.2 prose) ------------------------------
+    verdict_md = leaf_dir / "verdict.md"
+    prose = verdict_md.read_text() if verdict_md.exists() else ""
+
+    # --- Token usage accounting -------------------------------------------
     gm_path = leaf_dir / "grading_messages.json"
     tokens_input_est = 0
     if gm_path.exists():
@@ -903,13 +1086,13 @@ def cmd_record_verdict(args: argparse.Namespace) -> int:
             tokens_input_est = sum(count_tokens(m.get("content", "")) for m in msgs)
         except Exception:
             tokens_input_est = 0
-    tokens_output_est = count_tokens(prose)
+    tokens_output_est = count_tokens(prose) + count_tokens(json.dumps(score_data))
 
     ranked_files: list[str] = []
     rf = leaf_dir / "ranked_files.txt"
     if rf.exists():
         ranked_files = [line.strip() for line in rf.read_text().splitlines() if line.strip()]
-    files_shown = []
+    files_shown: list[str] = []
     fs = leaf_dir / "files_shown.json"
     if fs.exists():
         try:
@@ -918,16 +1101,16 @@ def cmd_record_verdict(args: argparse.Namespace) -> int:
             pass
 
     verdict = {
-        "score": score_val,
-        "valid_score": bool(args.valid_score),
-        "justification": args.justification or "",
+        "score": final_score,
+        "valid_score": valid_score,
+        "justification": explanation,
         "prose_verdict": prose,
         "ranked_files": ranked_files,
         "files_shown_to_grader": files_shown,
-        "short_circuit_reason": args.short_circuit,
+        "short_circuit_reason": None,
         "tokens_input_est": tokens_input_est,
         "tokens_output_est": tokens_output_est,
-        "grading_seconds": args.grading_seconds or 0.0,
+        "grading_seconds": 0.0,
     }
     _write_json(leaf_dir / "verdict.json", verdict)
     state["verdicts"][leaf_id] = verdict
@@ -937,7 +1120,7 @@ def cmd_record_verdict(args: argparse.Namespace) -> int:
     totals["output_tokens_est"] += tokens_output_est
     totals["leaves_graded"] += 1
     _write_json(paths["state"], state)
-    print(f"[record-verdict] leaf {leaf_id}: score={score_val} valid={verdict['valid_score']}")
+    print(f"[record-verdict] leaf {leaf_id}: score={final_score} valid={valid_score}")
     return 0
 
 
@@ -1187,21 +1370,23 @@ def cmd_status(args: argparse.Namespace) -> int:
     state = _read_json(paths["state"])
     total = len(state["leaves"])
     done = sum(1 for v in state["leaf_statuses"].values() if v == "done")
+    ctx_prepared = sum(1 for v in state["leaf_statuses"].values() if v == "context_prepared")
     ranked = sum(1 for v in state["leaf_statuses"].values() if v == "ranked")
-    pending = total - done - ranked
+    pending = total - done - ranked - ctx_prepared
     print(f"workdir: {workdir}")
     print(f"leaves total: {total}")
-    print(f"  pending:    {pending}")
-    print(f"  ranked:     {ranked}")
-    print(f"  done:       {done}")
-    if pending + ranked == 0:
+    print(f"  pending:            {pending}       (Step 1.0 not done — ranking needed)")
+    print(f"  ranked:             {ranked}       (Step 1.0 done; Step 1.1 next)")
+    print(f"  context_prepared:   {ctx_prepared}       (Step 1.1 done; Step 1.2 grading next)")
+    print(f"  done:               {done}       (Step 1.4 done; verdict recorded)")
+    if pending + ranked + ctx_prepared == 0:
         print("all leaves graded — ready for finalize.")
     else:
-        print("next pending leaves:")
+        print("next non-done leaves:")
         i = 0
         for lid, st in state["leaf_statuses"].items():
             if st != "done":
-                print(f"  {st:8}  {lid}")
+                print(f"  {st:18}  {lid}")
                 i += 1
                 if i >= 10:
                     break
@@ -1226,21 +1411,44 @@ def main() -> int:
     p_init.add_argument("--context-window-tokens", type=int, default=DEFAULT_CONTEXT_WINDOW_TOKENS)
     p_init.set_defaults(func=cmd_init)
 
-    p_rr = sub.add_parser("record-ranking")
+    p_rr = sub.add_parser(
+        "record-ranking",
+        help="Step 1.0 output: record the top-K file ranking Claude produced.",
+    )
     p_rr.add_argument("workdir")
     p_rr.add_argument("leaf_id")
-    p_rr.add_argument("ranked_files_path")
+    p_rr.add_argument(
+        "ranked_files_path",
+        nargs="?",
+        default=None,
+        help="Path to the file containing Claude's newline-separated ranked filepaths. "
+             "Defaults to .judge/leaves/<leaf_id>/ranked_files.txt.",
+    )
     p_rr.set_defaults(func=cmd_record_ranking)
 
-    p_rv = sub.add_parser("record-verdict")
+    p_pg = sub.add_parser(
+        "prepare-grading-context",
+        help=(
+            "Step 1.1: fetch ranked file contents (200 kB cap) under the token "
+            "budget, assemble the 8-message grading prompt verbatim, and write "
+            "grading_context.md — the single input Claude reads in Step 1.2."
+        ),
+    )
+    p_pg.add_argument("workdir")
+    p_pg.add_argument("leaf_id")
+    p_pg.set_defaults(func=cmd_prepare_grading_context)
+
+    p_rv = sub.add_parser(
+        "record-verdict",
+        help=(
+            "Step 1.4: record the final verdict for a leaf. Reads the prose from "
+            "verdict.md (Step 1.2) and the structured score from score.json "
+            "(Step 1.3). Does NOT accept a --score flag — the structured score "
+            "MUST come from the separate score-extraction reasoning pass."
+        ),
+    )
     p_rv.add_argument("workdir")
     p_rv.add_argument("leaf_id")
-    p_rv.add_argument("prose_path", nargs="?")
-    p_rv.add_argument("--score", required=True)
-    p_rv.add_argument("--valid-score", type=_parse_bool, default=True)
-    p_rv.add_argument("--justification", default="")
-    p_rv.add_argument("--short-circuit", default=None)
-    p_rv.add_argument("--grading-seconds", type=float, default=0.0)
     p_rv.set_defaults(func=cmd_record_verdict)
 
     p_fin = sub.add_parser("finalize")
