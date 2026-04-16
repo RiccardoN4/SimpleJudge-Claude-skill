@@ -321,3 +321,7 @@ What is NOT a deviation (all of these match upstream exactly):
 - Failed-leaf handling (score=0.0, valid_score=False).
 - `grader_output.json` shape (tree + `simple_judge_compat.{root_score,
   per_leaf_scores, tree}`).
+- pAI-Replicator layout auto-detection is a convenience for input resolution
+  only. It changes WHERE the driver reads paper/rubric/submission from, but
+  does not change any prompt, message ordering, traversal, aggregation,
+  output schema, or grading logic. SimpleJudge fidelity is unchanged.

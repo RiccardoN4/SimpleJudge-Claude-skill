@@ -468,16 +468,116 @@ class LeafPromptBundle:
 
 
 # ---------------------------------------------------------------------------
+# Layout detection
+# ---------------------------------------------------------------------------
+#
+# The skill supports two input layouts:
+#
+#   (1) canonical — rubric.json, paper.md/pdf, [addendum.md], submission/ all
+#       live directly under <workdir>. All judge outputs also land under
+#       <workdir>.
+#
+#   (2) pAI-Replicator — <workdir> is a `replication_<timestamp>/` root. The
+#       rubric, paper, and addendum live under <workdir>/input/, and the
+#       submission is the sole subdirectory of <workdir>/code_workspace/.
+#       Judge outputs land in a NEW <workdir>/judge_output/ so the
+#       replication's own artefacts stay untouched.
+#
+# The layout decision is the ONLY thing this detection layer does. It does
+# not change any prompt, message ordering, traversal, aggregation, output
+# schema, or grading logic — see reference/simple_judge_port_notes.md §14.
+
+def detect_pai_replicator_layout(workdir: Path) -> Optional[dict[str, Any]]:
+    """Return a dict of resolved paths if `workdir` is a pAI-Replicator
+    replication root, else None.
+
+    Detection rules (ALL must hold to return a dict):
+      - <workdir>/input/         exists and is a directory
+      - <workdir>/code_workspace/ exists and is a directory
+      - <workdir>/input/rubric.json exists
+      - <workdir>/input/paper.md OR <workdir>/input/paper.pdf exists
+      - <workdir>/code_workspace/ contains exactly one subdirectory
+
+    If all preliminary rules hold but `code_workspace/` has 0 or 2+
+    subdirectories, raises RuntimeError with a clear message — this is an
+    unambiguous abort, not a fall-through.
+
+    paper.md is preferred over paper.pdf when both exist (already extracted,
+    no PDF parsing needed).
+    """
+    input_dir = workdir / "input"
+    cw_dir = workdir / "code_workspace"
+
+    if not input_dir.is_dir() or not cw_dir.is_dir():
+        return None
+    rubric_path = input_dir / "rubric.json"
+    if not rubric_path.exists():
+        return None
+    paper_md = input_dir / "paper.md"
+    paper_pdf = input_dir / "paper.pdf"
+    if not paper_md.exists() and not paper_pdf.exists():
+        return None
+
+    # All preliminary rules satisfied — treat as pAI-Replicator. Now enforce
+    # the "exactly one submission" invariant.
+    sub_dirs = [p for p in sorted(cw_dir.iterdir()) if p.is_dir()]
+    if len(sub_dirs) == 0:
+        raise RuntimeError(
+            "pAI-Replicator layout detected but code_workspace/ is empty. "
+            "The replication may not have completed Phase 4+. Aborting."
+        )
+    if len(sub_dirs) > 1:
+        raise RuntimeError(
+            "pAI-Replicator layout detected but code_workspace/ contains "
+            "2+ subdirectories. Cannot auto-detect which is the submission. "
+            "Use canonical layout instead."
+        )
+
+    submission_dir = sub_dirs[0]
+    paper_source = paper_md if paper_md.exists() else paper_pdf
+    addendum = input_dir / "addendum.md"
+
+    return {
+        "layout": "pai-replicator",
+        "rubric_path": rubric_path,
+        "paper_source": paper_source,
+        "addendum_path": addendum if addendum.exists() else None,
+        "submission_dir": submission_dir,
+        "output_root": workdir / "judge_output",
+    }
+
+
+# ---------------------------------------------------------------------------
 # State management
 # ---------------------------------------------------------------------------
 
-def _workdir_paths(workdir: Path) -> dict[str, Path]:
-    judge = workdir / ".judge"
+def _resolve_output_root(workdir: Path) -> Path:
+    """For subcommands AFTER init: locate the output_root by looking for an
+    existing state file. Prefers <workdir>/judge_output/.judge/ (pAI-
+    Replicator layout) if its state exists, else falls back to
+    <workdir>/.judge/ (canonical layout)."""
+    pair_state = workdir / "judge_output" / ".judge" / "judge_state.json"
+    canon_state = workdir / ".judge" / "judge_state.json"
+    if pair_state.exists():
+        return workdir / "judge_output"
+    if canon_state.exists():
+        return workdir
+    # No state anywhere: default to canonical. Init will override explicitly.
+    return workdir
+
+
+def _workdir_paths(workdir: Path, output_root: Optional[Path] = None) -> dict[str, Path]:
+    """Returns the judge's filesystem paths under `output_root`. When
+    `output_root` is omitted (the common case for every subcommand except
+    init), it is auto-resolved via `_resolve_output_root`."""
+    root = output_root if output_root is not None else _resolve_output_root(workdir)
+    judge = root / ".judge"
     return {
         "judge": judge,
         "state": judge / "judge_state.json",
         "leaves": judge / "leaves",
         "log": judge / "run.log",
+        "output_root": root,
     }
 
 
@@ -490,24 +590,25 @@ def _write_json(p: Path, data: Any) -> None:
     p.write_text(json.dumps(data, indent=2))
 
 
-def _resolve_paper(workdir: Path) -> tuple[Path, Path]:
-    """Returns (paper_md_path, paper_source_path)."""
-    paper_md = workdir / "paper.md"
-    paper_pdf = workdir / "paper.pdf"
-    if paper_md.exists():
-        return paper_md, paper_md
-    if paper_pdf.exists():
-        # Extract via helper script.
+def _resolve_paper(paper_source: Path, output_root: Path) -> tuple[Path, Path]:
+    """Returns (paper_md_path, paper_source_path). If `paper_source` is a
+    markdown file, it is used directly. If it is a PDF, it is extracted to
+    `output_root/paper.md` (NOT into the input/ tree — we never write back
+    into pAI-Replicator's read-only input directory)."""
+    if paper_source.suffix.lower() == ".md":
+        return paper_source, paper_source
+    if paper_source.suffix.lower() == ".pdf":
         from subprocess import run as sprun
-        out_md = workdir / "paper.md"
+        output_root.mkdir(parents=True, exist_ok=True)
+        out_md = output_root / "paper.md"
         r = sprun(
-            [sys.executable, str(HERE / "extract_paper_text.py"), str(paper_pdf), str(out_md)],
+            [sys.executable, str(HERE / "extract_paper_text.py"), str(paper_source), str(out_md)],
             capture_output=True, text=True,
         )
         if r.returncode != 0:
             raise RuntimeError(f"paper extraction failed:\n{r.stderr}")
-        return out_md, paper_pdf
-    raise FileNotFoundError(f"no paper.md or paper.pdf under {workdir}")
+        return out_md, paper_source
+    raise ValueError(f"Unsupported paper source extension: {paper_source}")
 
 
 # ---------------------------------------------------------------------------
@@ -520,22 +621,67 @@ def cmd_init(args: argparse.Namespace) -> int:
         print(f"workdir not found or not a dir: {workdir}", file=sys.stderr)
         return 1
 
-    submission = workdir / "submission"
-    if not submission.is_dir():
-        print(f"submission/ missing under {workdir}", file=sys.stderr)
+    # -----------------------------------------------------------------------
+    # Layout detection: pAI-Replicator replication root or canonical workdir?
+    # This chooses WHERE inputs are read from and WHERE outputs are written,
+    # nothing else. Grading logic is unchanged.
+    # -----------------------------------------------------------------------
+    try:
+        pai_layout = detect_pai_replicator_layout(workdir)
+    except RuntimeError as e:
+        print(f"[init] {e}", file=sys.stderr)
         return 1
 
-    rubric_path = workdir / "rubric.json"
-    if not rubric_path.exists():
-        print(f"rubric.json missing under {workdir}", file=sys.stderr)
-        return 1
+    if pai_layout is not None:
+        layout = "pai-replicator"
+        output_root = pai_layout["output_root"]
+        submission = pai_layout["submission_dir"]
+        rubric_path = pai_layout["rubric_path"]
+        paper_source_detected = pai_layout["paper_source"]
+        addendum_path = pai_layout["addendum_path"]  # Path or None
 
-    paper_md_path, paper_source = _resolve_paper(workdir)
+        # Emit the resolved-paths block IMMEDIATELY, before any other init
+        # output, so users see the detection result up front.
+        print("[init] Detected pAI-Replicator layout. Resolved inputs:")
+        print(f"[init]   rubric:     {rubric_path}")
+        print(f"[init]   paper:      {paper_source_detected}")
+        print(f"[init]   addendum:   {addendum_path if addendum_path else '(none)'}")
+        print(f"[init]   submission: {submission}")
+        print("[init]")
+    else:
+        layout = "canonical"
+        output_root = workdir
+        submission = workdir / "submission"
+        if not submission.is_dir():
+            print(f"submission/ missing under {workdir}", file=sys.stderr)
+            return 1
+        rubric_path = workdir / "rubric.json"
+        if not rubric_path.exists():
+            print(f"rubric.json missing under {workdir}", file=sys.stderr)
+            return 1
+        # Choose paper source: prefer paper.md, fall back to paper.pdf.
+        if (workdir / "paper.md").exists():
+            paper_source_detected = workdir / "paper.md"
+        elif (workdir / "paper.pdf").exists():
+            paper_source_detected = workdir / "paper.pdf"
+        else:
+            print(f"no paper.md or paper.pdf under {workdir}", file=sys.stderr)
+            return 1
+        _add = workdir / "addendum.md"
+        addendum_path = _add if _add.exists() else None
+
+    output_root.mkdir(parents=True, exist_ok=True)
+
+    paper_md_path, paper_source = _resolve_paper(paper_source_detected, output_root)
     paper_md = paper_md_path.read_text()
 
-    addendum_path = workdir / "addendum.md"
-    addendum = addendum_path.read_text() if addendum_path.exists() else ""
-    judge_addendum_path = workdir / "judge_addendum.md"
+    addendum = addendum_path.read_text() if (addendum_path and addendum_path.exists()) else ""
+    # judge_addendum.md (if any) is expected next to addendum.md, mirroring
+    # upstream's join of `addendum + judge_addendum` at simple.py:113.
+    judge_addendum_dir = addendum_path.parent if addendum_path else (
+        (workdir / "input") if layout == "pai-replicator" else workdir
+    )
+    judge_addendum_path = judge_addendum_dir / "judge_addendum.md"
     judge_addendum = judge_addendum_path.read_text() if judge_addendum_path.exists() else ""
     joined_addendum = f"{addendum}\n{judge_addendum}".strip() or "(NO ADDENDUM GIVEN)"
 
@@ -580,7 +726,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     if args.max_leaves is not None:
         leaves = leaves[: args.max_leaves]
 
-    paths = _workdir_paths(workdir)
+    paths = _workdir_paths(workdir, output_root=output_root)
     paths["judge"].mkdir(parents=True, exist_ok=True)
     paths["leaves"].mkdir(parents=True, exist_ok=True)
 
@@ -665,11 +811,13 @@ def cmd_init(args: argparse.Namespace) -> int:
 
     state = {
         "workdir": str(workdir),
+        "layout": layout,
+        "output_root": str(output_root),
         "submission_path": str(submission),
         "rubric_path": str(rubric_path),
         "paper_path": str(paper_source),
         "paper_md_path": str(paper_md_path),
-        "addendum_path": str(addendum_path) if addendum_path.exists() else None,
+        "addendum_path": str(addendum_path) if addendum_path else None,
         "code_only": args.code_only,
         "max_prior_nodes": args.max_prior_nodes,
         "max_files": args.max_files,
@@ -696,15 +844,17 @@ def cmd_init(args: argparse.Namespace) -> int:
     }
     _write_json(paths["state"], state)
 
-    print(f"[init] workdir:   {workdir}")
-    print(f"[init] leaves:    {len(leaves)} total "
+    print(f"[init] workdir:     {workdir}")
+    print(f"[init] layout:      {layout}")
+    print(f"[init] output_root: {output_root}")
+    print(f"[init] leaves:      {len(leaves)} total "
           f"({len(preseeded_verdicts)} short-circuited, "
           f"{len(leaves) - len(preseeded_verdicts)} to grade)")
-    print(f"[init] code_only: {args.code_only}")
-    print(f"[init] paper:     {paper_source}")
-    print(f"[init] rubric:    {rubric_path}")
-    print(f"[init] submission:{submission}")
-    print(f"[init] state:     {paths['state']}")
+    print(f"[init] code_only:   {args.code_only}")
+    print(f"[init] paper:       {paper_source}")
+    print(f"[init] rubric:      {rubric_path}")
+    print(f"[init] submission:  {submission}")
+    print(f"[init] state:       {paths['state']}")
     print(f"[init] reproduce_touched_files (Result Analysis): "
           f"{reproduce_touched_by_cat.get('Result Analysis', True)}")
     print(f"[init] token encoder: {'tiktoken.o200k_base' if _ENCODER else 'len//4 fallback'}")
@@ -1289,7 +1439,10 @@ def cmd_finalize(args: argparse.Namespace) -> int:
         },
     }
 
-    out_json = workdir / "grader_output.json"
+    # Outputs land under output_root (workdir for canonical, workdir/judge_output
+    # for pAI-Replicator layout). paths["output_root"] is the resolved choice.
+    output_root = paths["output_root"]
+    out_json = output_root / "grader_output.json"
     _write_json(out_json, grader_output)
 
     # token_usage.json (per-leaf + totals, Claude-style)
@@ -1303,7 +1456,7 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             for lid, v in verdicts.items()
         },
     }
-    _write_json(workdir / "token_usage.json", token_usage)
+    _write_json(output_root / "token_usage.json", token_usage)
 
     # judge_log.md
     lines = [
@@ -1340,8 +1493,10 @@ def cmd_finalize(args: argparse.Namespace) -> int:
             for f in lv["ranked_files"][:5]:
                 lines.append(f"- `{f}`")
             lines.append("")
-    (workdir / "judge_log.md").write_text("\n".join(lines))
+    (output_root / "judge_log.md").write_text("\n".join(lines))
 
+    print(f"[finalize] layout:     {state.get('layout', 'canonical')}")
+    print(f"[finalize] output_root:{output_root}")
     print(f"[finalize] wrote {out_json}")
     print(f"[finalize] root_score = {root_score:.4f}")
     print(f"[finalize] leaves graded = {state['token_usage_total']['leaves_graded']} / {len(state['leaves'])}")
@@ -1368,6 +1523,8 @@ def cmd_status(args: argparse.Namespace) -> int:
         print("no state — run init first.")
         return 1
     state = _read_json(paths["state"])
+    print(f"layout:      {state.get('layout', 'canonical')}")
+    print(f"output_root: {paths['output_root']}")
     total = len(state["leaves"])
     done = sum(1 for v in state["leaf_statuses"].values() if v == "done")
     ctx_prepared = sum(1 for v in state["leaf_statuses"].values() if v == "context_prepared")

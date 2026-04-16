@@ -72,8 +72,11 @@ score_from_children(children) = (
 
 ## Invocation
 
-In Claude Code, invoke the skill with a path to a working directory that has
-the expected layout:
+The skill recognises **two** input layouts.
+
+### Canonical layout
+
+Pass a workdir containing:
 
 ```
 <workdir>/
@@ -86,13 +89,57 @@ the expected layout:
     └── reproduce.log      # optional
 ```
 
-Ask Claude something like:
+Outputs (`grader_output.json`, `judge_log.md`, `token_usage.json`, `.judge/`)
+are written directly into the workdir.
+
+### pAI-Replicator layout (auto-detected)
+
+When the workdir is a pAI-Replicator
+([pAI-Replicator-claude](https://github.com/PoggioAI/pAI-Replicator-claude))
+replication root, the skill auto-detects this structure:
+
+```
+<workdir>/
+├── input/
+│   ├── rubric.json          ← used as rubric
+│   ├── paper.md or .pdf     ← used as paper (paper.md preferred)
+│   └── addendum.md          ← used if present
+├── code_workspace/
+│   └── <paper_short_name>/  ← used as submission (must be exactly one subdir)
+└── ...other pAI-Replicator artifacts (preserved untouched)
+```
+
+Detection is automatic — there is no `--pai-replicator-mode` flag. If
+`<workdir>/input/` and `<workdir>/code_workspace/` both exist with the right
+contents, the skill uses them and writes ALL outputs into a NEW
+`<workdir>/judge_output/` directory:
+
+```
+<workdir>/judge_output/
+├── grader_output.json
+├── judge_log.md
+├── token_usage.json
+└── .judge/
+```
+
+This keeps the replication's own artifacts (`analysis_workspace/`,
+`verification_workspace/`, `persona_workspace/`, etc.) untouched. A user
+looking at the replication directory sees a clear separation:
+pAI-Replicator generated everything except `judge_output/`, which
+paperbench-judge generated.
+
+If `code_workspace/` is empty or contains 2+ subdirectories, `init` aborts
+with a clear error rather than guessing.
+
+### Invocation examples
 
 > "Run paperbench-judge on /path/to/workdir."
 
-Or with flags:
-
 > "Run paperbench-judge on /path/to/workdir with --code-only."
+
+> "Use paperbench-judge to evaluate this replication, code-only:
+> /path/to/replication_20260406_123706/"
+
 > "Run paperbench-judge on /path/to/workdir but only the first 3 leaves
 > (testing)."
 
@@ -113,13 +160,24 @@ Or with flags:
 ### Resume
 
 If the skill is interrupted mid-run, re-invoke with `RESUME:` prepended to
-your prompt, pointing at the same working directory. The skill reads
-`<workdir>/.judge/judge_state.json` and continues from the first pending leaf.
-No re-grading is done.
+your prompt, pointing at the same working directory. The skill auto-finds
+the state file at either:
+
+- `<workdir>/.judge/judge_state.json`              (canonical layout)
+- `<workdir>/judge_output/.judge/judge_state.json` (pAI-Replicator layout)
+
+and continues from the first non-done leaf. No re-grading is done.
 
 ---
 
-## Outputs (written to `<workdir>/`)
+## Outputs (written to `<output_root>/`)
+
+The `<output_root>` depends on the layout:
+
+- canonical layout — `<output_root>` is `<workdir>`
+- pAI-Replicator layout — `<output_root>` is `<workdir>/judge_output/`
+
+Files written:
 
 - `grader_output.json` — the extended report (see below).
 - `judge_log.md` — human-readable trace of every leaf's verdict.

@@ -46,14 +46,51 @@ LLM calls into fewer passes is a Zero Deviation Rule violation.
 
 ## Inputs
 
-The skill is invoked with a path to a **working directory** containing:
+The skill recognises **two** input layouts.
+
+### Canonical layout
+
+Pass a workdir containing:
 
 - `rubric.json` — PaperBench-format rubric (`TaskNode` tree).
-- `paper.pdf` **or** `paper.md` — the paper. `paper.md` is preferred. If only
-  the PDF exists, Pass 0 extracts it.
+- `paper.pdf` or `paper.md` — the paper (`paper.md` preferred; if only the
+  PDF exists, Pass 0 extracts it).
 - `addendum.md` (optional) — paper addendum.
 - `submission/` — the candidate codebase directory. If `reproduce.sh` /
   `reproduce.log` exist, they live under `submission/`.
+
+Outputs (`grader_output.json`, `judge_log.md`, `token_usage.json`, `.judge/`)
+are written directly into the workdir.
+
+### pAI-Replicator layout (auto-detected)
+
+When the workdir is a pAI-Replicator replication root, the skill auto-detects
+this structure:
+
+```
+<workdir>/
+├── input/
+│   ├── rubric.json          ← used as rubric
+│   ├── paper.md or .pdf     ← used as paper (paper.md preferred)
+│   └── addendum.md          ← used if present
+├── code_workspace/
+│   └── <paper_short_name>/  ← used as submission (must be exactly one subdir)
+└── ...other pAI-Replicator artifacts (preserved untouched)
+```
+
+Detection is automatic. If `<workdir>/input/` and `<workdir>/code_workspace/`
+both exist with the right contents, the skill uses them. Outputs are written
+into `<workdir>/judge_output/` to keep them separate from pAI-Replicator's
+own artifacts (the replication directory stays exactly as pAI-Replicator
+left it, plus a new `judge_output/` subdirectory).
+
+To invoke on a pAI-Replicator replication, just pass the replication root:
+
+> "Use paperbench-judge to evaluate this replication, code-only:
+> /path/to/replication_<timestamp>/"
+
+If `code_workspace/` is empty or contains 2+ subdirectories, `init` aborts
+with a clear error rather than guessing which directory is the submission.
 
 ## Flags (parsed from the user prompt)
 
@@ -69,12 +106,20 @@ at `simple.py:80` and `simple.py:81`.
 | `--max-prior-nodes N` | unlimited | Truncate the preceding-criteria chain (matches `simple.py:82`). |
 | `--max-files N` | 10 | Top-K for file ranking (matches `simple.py:375`). |
 
-## Outputs (produced in the working directory)
+## Outputs
 
-- `grader_output.json` — extended SimpleJudge-compatible report.
-- `judge_log.md` — human-readable trace.
-- `token_usage.json` — per-leaf and total token-count estimates.
-- `.judge/` — internal state & per-leaf artefacts (also used for RESUME).
+All four output locations live under the **output_root**, which is:
+
+- the `<workdir>` itself for the canonical layout, and
+- `<workdir>/judge_output/` for the pAI-Replicator layout.
+
+Outputs:
+
+- `<output_root>/grader_output.json` — extended SimpleJudge-compatible report.
+- `<output_root>/judge_log.md` — human-readable trace.
+- `<output_root>/token_usage.json` — per-leaf and total token-count estimates.
+- `<output_root>/.judge/` — internal state & per-leaf artefacts (also used
+  for RESUME).
 
 ### Per-leaf artefacts under `.judge/leaves/<leaf_id>/`
 
@@ -92,8 +137,11 @@ verdict.json          — Step 1.4 output (written by record-verdict)
 
 ## RESUME protocol
 
-If the user's invocation begins with `RESUME:`, or if `.judge/judge_state.json`
-already exists, do NOT re-init. Run:
+If the user's invocation begins with `RESUME:`, or if a `judge_state.json`
+already exists (under `<workdir>/.judge/` for canonical layout, or under
+`<workdir>/judge_output/.judge/` for pAI-Replicator layout), do NOT re-init.
+The driver auto-resolves the state location from either place — just pass
+the workdir. Run:
 
 ```
 python scripts/judge_driver.py status <workdir>
