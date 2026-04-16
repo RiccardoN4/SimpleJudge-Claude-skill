@@ -1,0 +1,11 @@
+The full grading rubric for the paper hierarchically decomposes various aspects of the paper. To provide more context for the criterion you are currently grading, here are some of the preceding criteria (DO NOT grade this, this is just for context):
+<preceding_criteria>
+{preceding_criteria}
+</preceding_criteria>
+
+Now, here is the criterion that you are grading:
+<criterion>
+{criterion}
+</criterion>
+
+The criterion you are grading is of type {task_category} - {task_category_question}

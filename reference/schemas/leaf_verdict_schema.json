@@ -1,0 +1,54 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "Per-leaf verdict",
+  "description": "Single leaf grading record. Matches SimpleJudge's per-leaf semantics: score is 0 or 1 for standard leaves; 0..1 float for Subtree shim leaves; valid_score=False signals a grading failure (score defaults to 0).",
+  "type": "object",
+  "required": [
+    "leaf_id",
+    "requirement",
+    "task_category",
+    "score",
+    "valid_score",
+    "justification",
+    "ranked_files",
+    "prose_verdict"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "leaf_id": { "type": "string" },
+    "requirement": { "type": "string" },
+    "task_category": {
+      "type": ["string", "null"],
+      "enum": ["Code Development", "Code Execution", "Result Analysis", "Subtree", null]
+    },
+    "finegrained_task_category": { "type": ["string", "null"] },
+    "weight": { "type": "number", "minimum": 0 },
+    "score": { "type": "number", "minimum": 0, "maximum": 1 },
+    "valid_score": { "type": "boolean" },
+    "justification": {
+      "type": "string",
+      "description": "Short explanation (the `explanation` field in SimpleJudge's ParsedJudgeResponse)."
+    },
+    "ranked_files": {
+      "type": "array",
+      "description": "Output of the file-ranking step, in descending order of relevance (up to max_files).",
+      "items": { "type": "string" }
+    },
+    "files_shown_to_grader": {
+      "type": "array",
+      "description": "Subset of ranked_files whose contents actually fit in the context budget and were concatenated into the leaf prompt.",
+      "items": { "type": "string" }
+    },
+    "prose_verdict": {
+      "type": "string",
+      "description": "The full # Expectations / # Reality / # Score response from the grading step."
+    },
+    "tokens_input_est": { "type": "integer", "minimum": 0 },
+    "tokens_output_est": { "type": "integer", "minimum": 0 },
+    "grading_seconds": { "type": "number", "minimum": 0 },
+    "short_circuit_reason": {
+      "type": ["string", "null"],
+      "description": "Set when the leaf was not graded via full LLM flow (e.g., Result Analysis auto-zero when reproduce.sh touched no files)."
+    }
+  }
+}

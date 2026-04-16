@@ -1,0 +1,140 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "title": "paperbench-judge grader_output.json",
+  "description": "Extended SimpleJudge-compatible grading report. The `simple_judge_compat` subsection mirrors the upstream SimpleJudge output byte-for-byte; all other fields are extensions.",
+  "type": "object",
+  "required": [
+    "rubric_path",
+    "submission_path",
+    "paper_path",
+    "backend",
+    "model",
+    "timestamp_start",
+    "timestamp_end",
+    "wall_clock_seconds",
+    "root_score",
+    "tree",
+    "leaf_verdicts",
+    "token_usage_total",
+    "cost_estimate_usd",
+    "simple_judge_compat"
+  ],
+  "additionalProperties": true,
+  "properties": {
+    "rubric_path": { "type": "string" },
+    "submission_path": { "type": "string" },
+    "paper_path": { "type": "string" },
+    "addendum_path": { "type": ["string", "null"] },
+    "backend": { "type": "string", "const": "claude-code-skill" },
+    "model": { "type": "string" },
+    "code_only": { "type": "boolean" },
+    "max_prior_nodes": { "type": ["integer", "null"] },
+    "max_files": { "type": "integer" },
+    "max_leaves": { "type": ["integer", "null"] },
+    "timestamp_start": { "type": "string", "format": "date-time" },
+    "timestamp_end": { "type": "string", "format": "date-time" },
+    "wall_clock_seconds": { "type": "number" },
+    "root_score": { "type": "number", "minimum": 0, "maximum": 1 },
+    "tree": { "$ref": "#/definitions/gradedNode" },
+    "leaf_verdicts": {
+      "type": "array",
+      "items": { "$ref": "#/definitions/leafVerdict" }
+    },
+    "token_usage_total": {
+      "type": "object",
+      "required": ["input_tokens_est", "output_tokens_est", "leaves_graded"],
+      "additionalProperties": false,
+      "properties": {
+        "input_tokens_est": { "type": "integer", "minimum": 0 },
+        "output_tokens_est": { "type": "integer", "minimum": 0 },
+        "leaves_graded": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "cost_estimate_usd": { "type": ["number", "null"] },
+    "simple_judge_compat": {
+      "type": "object",
+      "description": "Byte-for-byte mirror of the upstream SimpleJudge output shape.",
+      "required": ["root_score", "per_leaf_scores", "tree"],
+      "additionalProperties": false,
+      "properties": {
+        "root_score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "per_leaf_scores": {
+          "type": "object",
+          "description": "leaf_id -> score (0 or 1 for binary leaves; 0..1 float for Subtree leaves)",
+          "additionalProperties": { "type": "number" }
+        },
+        "tree": { "$ref": "#/definitions/gradedNode" }
+      }
+    }
+  },
+  "definitions": {
+    "gradedNode": {
+      "type": "object",
+      "required": [
+        "id",
+        "requirements",
+        "weight",
+        "score",
+        "valid_score",
+        "task_category",
+        "explanation",
+        "judge_metadata",
+        "sub_tasks"
+      ],
+      "additionalProperties": false,
+      "properties": {
+        "id": { "type": "string" },
+        "requirements": { "type": "string" },
+        "weight": { "type": "number", "minimum": 0 },
+        "score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "valid_score": { "type": "boolean" },
+        "task_category": { "type": ["string", "null"] },
+        "finegrained_task_category": { "type": ["string", "null"] },
+        "explanation": { "type": "string" },
+        "judge_metadata": { "type": ["object", "null"] },
+        "sub_tasks": {
+          "type": "array",
+          "items": { "$ref": "#/definitions/gradedNode" }
+        }
+      }
+    },
+    "leafVerdict": {
+      "type": "object",
+      "required": [
+        "leaf_id",
+        "requirement",
+        "task_category",
+        "score",
+        "valid_score",
+        "justification",
+        "ranked_files",
+        "prose_verdict"
+      ],
+      "additionalProperties": true,
+      "properties": {
+        "leaf_id": { "type": "string" },
+        "requirement": { "type": "string" },
+        "task_category": { "type": ["string", "null"] },
+        "finegrained_task_category": { "type": ["string", "null"] },
+        "weight": { "type": "number" },
+        "score": { "type": "number", "minimum": 0, "maximum": 1 },
+        "valid_score": { "type": "boolean" },
+        "justification": { "type": "string" },
+        "ranked_files": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "files_shown_to_grader": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Subset of ranked_files whose contents actually fit in the context budget."
+        },
+        "prose_verdict": { "type": "string" },
+        "tokens_input_est": { "type": "integer", "minimum": 0 },
+        "tokens_output_est": { "type": "integer", "minimum": 0 },
+        "grading_seconds": { "type": "number", "minimum": 0 },
+        "short_circuit_reason": { "type": ["string", "null"] }
+      }
+    }
+  }
+}

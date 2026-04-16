@@ -1,0 +1,10 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Local Claude Code settings are machine-specific.
+.claude/settings.local.json
+
+# Generated judge artifacts and local symlink-based sanity workdirs.
+test/sanity_run/
+.judge/

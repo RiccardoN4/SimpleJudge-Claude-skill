@@ -1,0 +1,5 @@
+You are judging an attempt to reproduce a research paper. You will be shown a paper, a resolution criteria, and a set of files.
+The resolution criteria is a specific aspect of the paper that you are marking. The set of files is the submission that someone has made, that is attempting to reproduce the paper.
+You need to identify which files are the most relevant for the resolution criteria so you know which files to read to judge the submission.
+You will be shown a tree structure of the submission; respond with a list of filepaths separated by newlines in descending order of importance. Each line should be a full filepath.
+List all the files that are shown to you, do not leave any out. Do not return anything else.
